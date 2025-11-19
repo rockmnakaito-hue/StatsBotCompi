@@ -39,6 +39,7 @@ if connecteam_file is not None:
     try:
         df_connecteam = pd.read_csv(connecteam_file)
         if 'Date' in df_connecteam.columns:
+            # Intentar parsear Date en formato MM/DD/YYYY; si falla, dejar como coerce
             df_connecteam['Date'] = pd.to_datetime(df_connecteam['Date'], errors='coerce', format="%m/%d/%Y")
         df_connecteam.to_pickle("connecteam.pkl")
         st.sidebar.success("Horario semanal actualizado.")
@@ -114,7 +115,6 @@ initial_dfs_turnos = {}
 initial_logs = []
 
 if df_connecteam_day.empty:
-    # no hay turnos para esa fecha
     initial_dfs_turnos = {}
 else:
     df_connecteam_day['Shift title'] = df_connecteam_day['Shift title'].astype(str).str.strip().str.title()
@@ -168,14 +168,23 @@ else:
 # ===============================
 #  SESSION STATE: persistir entre interacciones
 # ===============================
-if 'last_selected_date' not in st.session_state or st.session_state['last_selected_date'] != str(selected_date):
-    # nueva fecha: inicializar session_state con los dfs_turnos y logs
+# Inicializar session_state keys si no existen
+if 'last_selected_date' not in st.session_state:
+    st.session_state['last_selected_date'] = None
+if 'dfs_turnos' not in st.session_state:
+    st.session_state['dfs_turnos'] = {}
+if 'logs' not in st.session_state:
+    st.session_state['logs'] = []
+
+# Si la fecha cambió, reiniciamos los datos en session_state
+if st.session_state['last_selected_date'] != str(selected_date):
     st.session_state['dfs_turnos'] = initial_dfs_turnos.copy()
     st.session_state['logs'] = initial_logs.copy()
     st.session_state['last_selected_date'] = str(selected_date)
-# A partir de aquí trabajamos con session_state['dfs_turnos'] y ['logs']
-dfs_turnos_ss = st.session_state.get('dfs_turnos', {}).copy()
-logs_ss = st.session_state.get('logs', []).copy()
+
+# Trabajamos sobre copias extraíbles para evitar mutaciones accidentales
+dfs_turnos_ss = st.session_state.get('dfs_turnos', {})
+logs_ss = st.session_state.get('logs', [])
 
 # ===============================
 # MOSTRAR LOGS Y PREVIEWS (legibles desde session_state)
@@ -264,7 +273,6 @@ else:
             # inicializar turno si no existe en session_state
             if use_turno not in st.session_state['dfs_turnos']:
                 st.session_state['dfs_turnos'][use_turno] = pd.DataFrame(columns=df_live.columns.tolist())
-            # añadir filas y logs
             added = 0
             for k in selected_keys:
                 rows = candidates_df[candidates_df['_key'] == k]
@@ -276,8 +284,11 @@ else:
                 else:
                     st.session_state['logs'].append(f"⚠️ No se encontró la fila completa para {k} al asignar.")
             st.success(f"{len(selected_keys)} agente(s) asignado(s) a '{use_turno}'. ({added} filas añadidas)")
-            # después de asignar, recalc assigned_set y candidates (se forzará rerun y los widgets se actualizan)
-            st.experimental_rerun()
+            # Intentamos refrescar la app para que los previews se actualicen
+            try:
+                st.rerun()
+            except Exception:
+                st.warning("No se pudo refrescar automáticamente. Actualiza la página manualmente para ver los cambios.")
 
 # ===============================
 #  GENERAR XLSX Y DESCARGA (usa session_state)
@@ -304,7 +315,6 @@ def generate_xlsx_bytes(dfs_dict, out_basename="stats_por_turno", date_obj=selec
 
 st.markdown("---")
 if st.button("Generar archivo .xlsx y preparar descarga"):
-    # usar dfs_turnos desde session_state
     fname, xbytes = generate_xlsx_bytes(st.session_state.get('dfs_turnos', {}), "stats_por_turno", selected_date)
     st.success(f"Archivo generado: {fname}")
     st.download_button("📥 Descargar XLSX", data=xbytes, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
