@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
 import os
 
 # ===============================
-#  TÍTULO
+#  CONFIG
 # ===============================
 st.set_page_config(page_title="Bot para sacar STATS de turno", layout="wide")
 st.title("Bot para sacar STATS de turno")
@@ -132,8 +133,7 @@ logs = []
 
 # Si no hay connecteam para esa fecha, generamos un archivo vacío con la estructura del live (opcional)
 if df_connecteam_day.empty:
-    st.info("No se encontraron turnos para la fecha seleccionada (o no se cargó Connecteam). Se generará un Excel con hojas vacías según sea necesario.")
-    # no hacemos nada, dfs_turnos quedará vacío y al exportar crearemos hojas vacías si quieres
+    st.info("No se encontraron turnos para la fecha seleccionada (o no se cargó Connecteam). Se generará un Excel con hojas según los datos.")
 else:
     # normalizar columnas connecteam
     df_connecteam_day['Shift title'] = df_connecteam_day['Shift title'].astype(str).str.strip().str.title()
@@ -191,7 +191,7 @@ else:
         dfs_turnos[turno] = df_turno
 
 # ===============================
-#  MOSTRAR LOGS Y PREVIEWS (opcional)
+# MOSTRAR LOGS Y PREVIEWS
 # ===============================
 st.subheader("Logs / Advertencias")
 if logs:
@@ -209,11 +209,90 @@ for turno, df in dfs_turnos.items():
         else:
             st.dataframe(df.head(200))
 
+# ------------------------------
+# DETECCIÓN Y ASIGNACIÓN DE "HORAS EXTRA" / AGENTES NO ASIGNADOS
+# ------------------------------
+st.markdown("---")
+st.subheader("Detectar agentes en LiveAgent no asignados a ningún turno (horas extra)")
+
+# Umbral en minutos para considerar a alguien como 'trabajó' ese día
+threshold_minutes = st.number_input("Umbral mínimo de Tiempo de trabajo (minutos) para detectar horas extra", min_value=1, max_value=1440, value=15)
+
+# Construir conjunto de nombres ya asignados (First Last) desde dfs_turnos
+assigned_set = set()
+for df_ in dfs_turnos.values():
+    if df_ is None or df_.empty:
+        continue
+    if 'First Name' in df_.columns and 'Last Name' in df_.columns:
+        for _, r in df_.iterrows():
+            assigned_set.add(f"{str(r['First Name']).strip().title()} {str(r['Last Name']).strip().title()}".strip())
+    elif 'First Name' in df_.columns:
+        for _, r in df_.iterrows():
+            assigned_set.add(str(r['First Name']).strip().title())
+
+# Preparar campo 'Tiempo de trabajo' en minutos desde df_live
+if 'Tiempo de trabajo' in df_live.columns:
+    df_live['_tiempo_min'] = pd.to_numeric(df_live['Tiempo de trabajo'], errors='coerce') / 60.0
+else:
+    df_live['_tiempo_min'] = 0.0
+
+# Crear lista de candidatos: están en live, no están asignados y superan el umbral
+candidates_df = df_live.copy()
+
+def make_key(row):
+    fn = str(row.get('First Name', '')).strip().title()
+    ln = str(row.get('Last Name', '')).strip().title()
+    key = f"{fn} {ln}".strip()
+    if key == "" or key == " ":
+        return None
+    return key
+
+candidates_df['_key'] = candidates_df.apply(make_key, axis=1)
+candidates_df = candidates_df[candidates_df['_key'].notna()]
+candidates_df = candidates_df[~candidates_df['_key'].isin(assigned_set)]
+candidates_df = candidates_df[candidates_df['_tiempo_min'] > float(threshold_minutes)]
+
+# Mostrar candidatos (si los hay)
+if candidates_df.empty:
+    st.info("No se detectaron agentes no asignados que superen el umbral.")
+else:
+    st.write(f"Se detectaron {len(candidates_df)} agente(s) no asignado(s) que superan {threshold_minutes} minutos:")
+    selectable = [f"{r['_key']} — {r['_tiempo_min']:.1f} min" for _, r in candidates_df.iterrows()]
+    selected_items = st.multiselect("Selecciona los agentes que quieres asignar a un turno", options=selectable)
+
+    # Lista de turnos actuales para elegir destino
+    existing_turnos = list(dfs_turnos.keys())
+    existing_turnos_sorted = sorted(existing_turnos)
+    target_turno = st.selectbox("Selecciona el turno destino (o escribe uno nuevo abajo)", options=["-- Crear nuevo turno --"] + existing_turnos_sorted)
+
+    new_turno_name = None
+    if target_turno == "-- Crear nuevo turno --":
+        new_turno_name = st.text_input("Nombre del nuevo turno (ej. Jornada Extra)", value="Jornada Extra")
+        use_turno = new_turno_name.strip()
+    else:
+        use_turno = target_turno
+
+    if st.button("Asignar agentes seleccionados al turno"):
+        if not selected_items:
+            st.warning("Selecciona al menos un agente para asignar.")
+        else:
+            selected_keys = [s.split(" — ")[0] for s in selected_items]
+            if use_turno not in dfs_turnos:
+                dfs_turnos[use_turno] = pd.DataFrame(columns=df_live.columns.tolist())
+
+            for k in selected_keys:
+                rows = candidates_df[candidates_df['_key'] == k]
+                if not rows.empty:
+                    rows_to_add = rows.drop(columns=['_tiempo_min','_key'], errors='ignore').copy()
+                    dfs_turnos[use_turno] = pd.concat([dfs_turnos[use_turno], rows_to_add], ignore_index=True)
+                    logs.append(f"🔁 Asignado {k} al turno {use_turno} (horas extra detectada).")
+                else:
+                    logs.append(f"⚠️ No se encontró la fila completa para {k} al asignar.")
+            st.success(f"{len(selected_keys)} agente(s) asignado(s) a '{use_turno}'.")
+
 # ===============================
 #  GENERAR XLSX Y DESCARGA
 # ===============================
-from io import BytesIO
-
 def generate_xlsx_bytes(dfs_dict, out_basename="stats_por_turno", date_obj=selected_date):
     bio = BytesIO()
     date_str = pd.to_datetime(date_obj).strftime("%Y-%m-%d")
@@ -223,19 +302,18 @@ def generate_xlsx_bytes(dfs_dict, out_basename="stats_por_turno", date_obj=selec
             for turno, df in dfs_dict.items():
                 safe_name = str(turno)[:31]
                 if df.empty:
-                    # escribir encabezados del live si es posible
                     cols = df_live.columns.tolist() if not df_live.empty else []
                     empty_df = pd.DataFrame(columns=cols)
                     empty_df.to_excel(writer, sheet_name=safe_name, index=False)
                 else:
                     df.to_excel(writer, sheet_name=safe_name, index=False)
         else:
-            # si no hay turnos, crear una hoja con todos los live (por defecto)
             safe_name = "Todos"
             df_live.to_excel(writer, sheet_name=safe_name[:31], index=False)
     bio.seek(0)
     return fname, bio.getvalue()
 
+st.markdown("---")
 if st.button("Generar archivo .xlsx y preparar descarga"):
     fname, xbytes = generate_xlsx_bytes(dfs_turnos, "stats_por_turno", selected_date)
     st.success(f"Archivo generado: {fname}")
